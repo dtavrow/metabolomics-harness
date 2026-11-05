@@ -1,0 +1,9 @@
+{
+  "version": "common-metabolomics-v1",
+  "mappings": {
+    "positive:1": ["[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+"],
+    "positive:2": ["[M+2H]2+", "[M+H+Na]2+"],
+    "negative:1": ["[M-H]-", "[M+Cl]-", "[M+FA-H]-", "[M+CH3COO]-"],
+    "negative:2": ["[M-2H]2-"]
+  }
+}

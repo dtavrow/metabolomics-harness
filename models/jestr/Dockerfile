@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+FROM continuumio/miniconda3
+SHELL ["/bin/bash", "-lc"]
+RUN conda create -n jestr --solver=libmamba --override-channels \
+      -c pytorch -c nvidia -c conda-forge python=3.9.23 pip pytorch=2.0.1 \
+      pytorch-cuda=11.8 "mkl<2024.1" rdkit=2022.03.5 pyteomics=4.7.5 \
+      numpy=1.26.4 pandas scipy scikit-learn pyyaml tqdm requests lxml \
+      packaging setuptools=69 pyarrow -y \
+    && conda run -n jestr python -m pip install --no-cache-dir \
+      "dgl==1.1.2+cu118" -f https://data.dgl.ai/wheels/cu118/repo.html \
+    && conda run -n jestr python -m pip install --no-cache-dir \
+      dgllife==0.3.2 hyperopt==0.2.7 pubchempy==1.0.4 future \
+    && conda clean -afy
+ENV PATH=/opt/conda/envs/jestr/bin:${PATH}
+ENV DGLBACKEND=pytorch
+COPY models/common/ /app/
+COPY models/jestr/main.py models/jestr/default_backend.py models/jestr/preprocess.py /app/
+COPY models/jestr/modelfiles/ /opt/jestr/
+RUN /opt/conda/envs/jestr/bin/python /app/default_weights.py --model jestr
+ENV PYTHONPATH=/app:/opt/jestr
+WORKDIR /app
+ENTRYPOINT ["/opt/conda/envs/jestr/bin/python", "/app/main.py"]

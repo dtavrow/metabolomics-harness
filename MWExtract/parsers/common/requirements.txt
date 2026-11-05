@@ -1,0 +1,4 @@
+numpy==2.3.4
+pandas==2.3.3
+pyarrow==26.0.0
+pyteomics[xml]==5.0.1
