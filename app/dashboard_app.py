@@ -52,7 +52,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
     allow_origin_regex=allow_origin_regex,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
     # Cloudflare Access sets its session cookie on this hostname; the
     # frontend's fetch()/EventSource calls need to forward it cross-origin,
