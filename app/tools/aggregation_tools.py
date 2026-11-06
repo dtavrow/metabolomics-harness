@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 
 from app.app_utils.progress_bus import get_progress_bus
 from app.docker_environment import DockerPipelineEnvironment
+from app.ledger import append_ledger_row
 
 _environment = DockerPipelineEnvironment()
 
@@ -83,6 +84,10 @@ def aggregate_model_campaign_results(
             stage="aggregation", key=study_id, status="error",
             detail="no_predictions_found",
         )
+        append_ledger_row(
+            study_id, "aggregate", state="no_predictions_found",
+            run_id=run_id, model_names=model_names, missing_models=missing_models,
+        )
         return {
             "success": False,
             "status": "no_predictions_found",
@@ -93,18 +98,30 @@ def aggregate_model_campaign_results(
         _environment.study_output_dir(study_id) / study_id / "annotations"
         / "campaign_comparison" / f"{run_id}.tsv"
     )
+    # The scoring containers run as root (see run_analysis_model), so
+    # annotations/ can be root-owned; this host process can't mkdir a new
+    # subdirectory under it otherwise.
+    _environment.ensure_host_writable_dir(output_path.parent)
     _write_tsv(output_path, rows)
 
     get_progress_bus().publish(
         stage="aggregation", key=study_id, status="done",
         detail=f"{len(rows)} rows written",
     )
+    models_included = sorted({row["model_name"] for row in rows})
+    agreement = _rank_one_agreement(rows)
+    append_ledger_row(
+        study_id, "aggregate", state="aggregated",
+        run_id=run_id, output_tsv=str(output_path), rows_written=len(rows),
+        models_included=models_included, missing_models=missing_models,
+        agreement=agreement,
+    )
     return {
         "success": True,
         "status": "aggregated",
         "output_tsv": str(output_path),
         "rows_written": len(rows),
-        "models_included": sorted({row["model_name"] for row in rows}),
+        "models_included": models_included,
         "missing_models": missing_models,
-        "agreement": _rank_one_agreement(rows),
+        "agreement": agreement,
     }

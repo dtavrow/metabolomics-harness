@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from ftplib import FTP, error_perm
+from ftplib import FTP, all_errors, error_perm
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -96,23 +96,38 @@ def validate_study_id(study_id: str) -> str:
     return normalized
 
 
-@contextmanager
-def ftp_session(email: str, timeout: float = 60.0) -> Iterator[FTP]:
-    """Yield an anonymous binary FTP session in the Workbench Studies directory."""
+def _open_ftp(email: str, timeout: float) -> FTP:
+    """Open and initialize one anonymous binary-mode Workbench FTP connection."""
 
     ftp = FTP(MW_FTP_HOST, timeout=timeout)
     # See workbench_peek._open_ftp: active mode cannot work from a container.
     ftp.set_pasv(True)
+    ftp.login(user="anonymous", passwd=email)
+    ftp.cwd(MW_FTP_STUDIES_DIR)
+    ftp.voidcmd("TYPE I")
+    return ftp
+
+
+def _close_ftp(ftp: FTP | None) -> None:
+    """Close an FTP connection without masking the original pipeline error."""
+
+    if ftp is None:
+        return
     try:
-        ftp.login(user="anonymous", passwd=email)
-        ftp.cwd(MW_FTP_STUDIES_DIR)
-        ftp.voidcmd("TYPE I")
+        ftp.quit()
+    except Exception:
+        ftp.close()
+
+
+@contextmanager
+def ftp_session(email: str, timeout: float = 60.0) -> Iterator[FTP]:
+    """Yield an anonymous binary FTP session in the Workbench Studies directory."""
+
+    ftp = _open_ftp(email, timeout)
+    try:
         yield ftp
     finally:
-        try:
-            ftp.quit()
-        except Exception:
-            ftp.close()
+        _close_ftp(ftp)
 
 
 def _request_text(
@@ -509,6 +524,26 @@ def plan_study_mzml_download(
     )
 
 
+def _first_corrupt_zip_member(path: Path) -> str | None:
+    """Return the name of the first member that fails CRC validation, or
+    the reason the file is not a readable ZIP at all; ``None`` means the
+    whole archive checks out.
+
+    Matching size alone does not prove a resumed download is byte-correct:
+    if the local partial file's length and the server's REST offset for it
+    ever disagree, the appended bytes silently splice onto the wrong place
+    in the stream, producing a file of the expected size whose contents are
+    corrupt. This is the only check that would catch that before it reaches
+    extraction.
+    """
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip()
+    except zipfile.BadZipFile as exc:
+        return str(exc)
+
+
 def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     """Hash a downloaded archive without loading it into memory."""
 
@@ -526,8 +561,17 @@ def _download_selected_archives(
     email: str,
     max_total_archive_bytes: int,
     timeout: float,
+    max_retries: int = 8,
+    retry_backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0),
 ) -> pd.DataFrame:
-    """Download planned archives atomically while enforcing a total byte limit."""
+    """Download planned archives atomically while enforcing a total byte limit.
+
+    A stalled or reset FTP data connection (seen in practice as a
+    ``TimeoutError`` from ``retrbinary`` on slow Workbench transfers) retries
+    on a fresh connection rather than failing the whole batch outright; the
+    ``.part`` file's existing bytes are kept across retries so a retry
+    resumes instead of restarting.
+    """
 
     columns = ["study_id", "archive_name", "local_path", "bytes", "sha256", "status"]
     if archives.empty:
@@ -541,28 +585,71 @@ def _download_selected_archives(
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    with ftp_session(email, timeout) as ftp:
+    ftp: FTP | None = None
+    try:
         for archive in archives.itertuples():
             destination = output_dir / archive.archive_name
             partial = destination.with_name(destination.name + ".part")
             expected_size = int(archive.bytes)
-            if destination.exists() and destination.stat().st_size == expected_size:
+            if (
+                destination.exists()
+                and destination.stat().st_size == expected_size
+                and _first_corrupt_zip_member(destination) is None
+            ):
                 status = "cached"
             else:
-                offset = partial.stat().st_size if partial.exists() else 0
-                if offset > expected_size:
-                    partial.unlink()
-                    offset = 0
-                mode = "ab" if offset else "wb"
-                with partial.open(mode) as handle:
-                    ftp.retrbinary(
-                        f"RETR {archive.remote_name}",
-                        handle.write,
-                        blocksize=1024 * 1024,
-                        rest=offset if offset else None,
-                    )
-                if partial.stat().st_size != expected_size:
-                    raise IOError(f"Incomplete download for {archive.archive_name}.")
+                if destination.exists():
+                    # Size matched on a previous run but content did not;
+                    # a stale "cached" hit must not keep serving corrupt
+                    # bytes to every subsequent fetch attempt.
+                    destination.unlink()
+                for attempt in range(max_retries + 1):
+                    try:
+                        if ftp is None:
+                            ftp = _open_ftp(email, timeout)
+                        offset = partial.stat().st_size if partial.exists() else 0
+                        if offset > expected_size:
+                            partial.unlink()
+                            offset = 0
+                        mode = "ab" if offset else "wb"
+                        with partial.open(mode) as handle:
+                            ftp.retrbinary(
+                                f"RETR {archive.remote_name}",
+                                handle.write,
+                                blocksize=1024 * 1024,
+                                rest=offset if offset else None,
+                            )
+                        if partial.stat().st_size != expected_size:
+                            raise OSError(f"Incomplete download for {archive.archive_name}.")
+                        corrupt_member = _first_corrupt_zip_member(partial)
+                        if corrupt_member is not None:
+                            # A resumed transfer is the prime suspect (see
+                            # _first_corrupt_zip_member); only a full
+                            # re-download, not another resume on top of
+                            # corrupt bytes, can recover.
+                            partial.unlink()
+                            raise OSError(
+                                f"{archive.archive_name} failed CRC validation "
+                                f"(bad member {corrupt_member!r}); "
+                                "redownloading from scratch."
+                            )
+                        break
+                    except all_errors as exc:
+                        # A failed/aborted transfer can desynchronize FTP
+                        # control state, so every retry starts with a newly
+                        # authenticated connection.
+                        _close_ftp(ftp)
+                        ftp = None
+                        if attempt >= max_retries:
+                            raise
+                        delay = retry_backoff_seconds[
+                            min(attempt, len(retry_backoff_seconds) - 1)
+                        ]
+                        print(
+                            f"Retrying {archive.archive_name} in {delay:g}s "
+                            f"after {exc!r}."
+                        )
+                        time.sleep(delay)
                 partial.replace(destination)
                 status = "downloaded"
             rows.append(
@@ -575,6 +662,8 @@ def _download_selected_archives(
                     "status": status,
                 }
             )
+    finally:
+        _close_ftp(ftp)
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -585,6 +674,8 @@ def download_selected_archives(
     email: str,
     max_total_archive_bytes: int,
     timeout: float = 60.0,
+    max_retries: int = 8,
+    retry_backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0),
 ) -> pd.DataFrame:
     """Download a pre-inspected archive table for any supported raw format.
 
@@ -603,6 +694,8 @@ def download_selected_archives(
         Path(output_dir),
         email=email,
         max_total_archive_bytes=max_total_archive_bytes,
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
         timeout=timeout,
     )
 
@@ -627,9 +720,11 @@ def extract_selected_members(
     """Safely extract an arbitrary member plan into one flat output directory.
 
     ``members`` must identify each selected member by study and archive.
-    Every selected member is written as ``output_dir / basename``. Duplicate
-    basenames are rejected before extraction so one archive member can never
-    silently overwrite another.
+    Every selected member is written as ``output_dir / basename``, except
+    that members whose basename collides (seen in practice: polarity
+    subfolders reusing the same filename) are qualified with their parent
+    directory name instead, so one archive member can never silently
+    overwrite another.
 
     With ``discard_archives``, each ZIP is deleted once all of its planned
     members have been extracted, so peak disk is one archive plus the extracted
@@ -661,20 +756,44 @@ def extract_selected_members(
     unique_members = members.drop_duplicates(
         subset=["study_id", "archive_name", "member"]
     ).copy()
-    destinations: dict[str, tuple[str, str]] = {}
+
+    # Flattening drops each member's archive subdirectory, which collides
+    # when two different members share a basename -- seen in practice for
+    # studies that split one acquisition into polarity subfolders (NEG/,
+    # POS/) using otherwise identical filenames. Disambiguate those with
+    # their immediate parent directory name before falling back to
+    # rejecting a collision no amount of context can resolve.
+    sources_by_basename: dict[str, list[tuple[str, str]]] = {}
     for selected in unique_members.itertuples():
         member = _safe_zip_member(selected.member).as_posix()
-        basename = PurePosixPath(member).name
-        destination_key = basename.casefold()
         source = (str(selected.archive_name), member)
-        previous = destinations.get(destination_key)
-        if previous is not None and previous != source:
-            raise ValueError(
-                "Selected archive members cannot be flattened because their "
-                f"filenames collide: {previous[0]}:{previous[1]} and "
-                f"{source[0]}:{source[1]}."
-            )
-        destinations[destination_key] = source
+        basename_key = PurePosixPath(member).name.casefold()
+        sources_by_basename.setdefault(basename_key, []).append(source)
+
+    destination_names: dict[tuple[str, str], str] = {}
+    for sources in sources_by_basename.values():
+        unique_sources = sorted(set(sources))
+        if len(unique_sources) == 1:
+            (archive_name, member), = unique_sources
+            destination_names[archive_name, member] = PurePosixPath(member).name
+            continue
+        tagged: dict[str, tuple[str, str]] = {}
+        for archive_name, member in unique_sources:
+            basename = PurePosixPath(member).name
+            parent = PurePosixPath(member).parent.name
+            tag = re.sub(r"[^A-Za-z0-9._-]+", "_", parent) if parent else ""
+            name = f"{tag}__{basename}" if tag else basename
+            name_key = name.casefold()
+            previous = tagged.get(name_key)
+            if previous is not None and previous != (archive_name, member):
+                raise ValueError(
+                    "Selected archive members cannot be flattened because "
+                    "their filenames collide even after disambiguating by "
+                    f"parent directory: {previous[0]}:{previous[1]} and "
+                    f"{archive_name}:{member}."
+                )
+            tagged[name_key] = (archive_name, member)
+            destination_names[archive_name, member] = name
 
     total = int(unique_members["uncompressed_bytes"].sum())
     if total > max_total_uncompressed_bytes:
@@ -707,7 +826,8 @@ def extract_selected_members(
                 if mode == 0o120000:
                     raise ValueError(f"Symlink archive members are not extracted: {member}")
 
-                destination = (output_root / PurePosixPath(member).name).resolve()
+                destination_name = destination_names[str(archive_name), member]
+                destination = (output_root / destination_name).resolve()
                 if not destination.is_relative_to(output_root):
                     raise ValueError(f"ZIP member escapes the output directory: {member}")
                 output_root.mkdir(parents=True, exist_ok=True)

@@ -100,10 +100,10 @@ class PipelineConfig:
                 "MWEXTRACT_IMAGE", "mwextract:2026-09-26"
             ),
             mwparse_mzml_image=os.environ.get(
-                "MWPARSE_MZML_IMAGE", "mwparse-mzml:latest"
+                "MWPARSE_MZML_IMAGE", "mwparse-mzml:1"
             ),
             mwparse_mzxml_image=os.environ.get(
-                "MWPARSE_MZXML_IMAGE", "mwparse-mzxml:latest"
+                "MWPARSE_MZXML_IMAGE", "mwparse-mzxml:1"
             ),
             # LOOP_CONTRACT.md: the parser's spectrum count is post-QC, so it
             # is always <= the index's raw ms2_expected count by some

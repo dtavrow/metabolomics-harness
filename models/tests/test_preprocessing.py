@@ -19,6 +19,21 @@ def module(name: str, path: Path):
     return result
 
 
+class SiriusAdductNormalizationTests(unittest.TestCase):
+    def test_strips_spaces_to_match_ms_pred_lookup_tables(self):
+        sys.path.insert(0, str(ROOT / "models" / "sirius"))
+        sirius_main = module("sirius_main", ROOT / "models/sirius/main.py")
+        self.assertEqual(sirius_main._normalize_adduct("[M + Na]+"), "[M+Na]+")
+        self.assertEqual(sirius_main._normalize_adduct("[M + H]+"), "[M+H]+")
+        self.assertEqual(sirius_main._normalize_adduct("[M + K]+"), "[M+K]+")
+
+    def test_passes_through_none_and_already_unspaced(self):
+        sys.path.insert(0, str(ROOT / "models" / "sirius"))
+        sirius_main = module("sirius_main", ROOT / "models/sirius/main.py")
+        self.assertIsNone(sirius_main._normalize_adduct(None))
+        self.assertEqual(sirius_main._normalize_adduct("[M+H]+"), "[M+H]+")
+
+
 class PreprocessingTests(unittest.TestCase):
     def test_jestr_reproduces_training_peak_contract(self):
         jestr = module("jestr_preprocess", ROOT / "models/jestr/preprocess.py")

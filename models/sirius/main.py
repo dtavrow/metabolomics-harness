@@ -9,12 +9,12 @@ import sys
 from pathlib import Path
 
 import pyarrow as pa
-
 from candidates import candidate_id, write_candidates
 from contracts import ELIGIBILITY_SCHEMA, MODEL_SCHEMA_VERSION, PREDICTION_SCHEMA
+from preprocess import feature_id as _feature_id
+from preprocess import prepare as prepare_sirius
 from runtime import atomic_directory, utc_now, write_json, write_rows
 from spectra import qc_metrics, read_spectra
-from preprocess import feature_id as _feature_id, prepare as prepare_sirius
 
 QUALITY_SCHEMA = pa.schema([
     pa.field("schema_version", pa.string(), nullable=False),
@@ -54,6 +54,14 @@ def _value(row: dict, *names: str) -> str | None:
         if value is not None and str(value).strip():
             return str(value).strip()
     return None
+
+
+def _normalize_adduct(value: str | None) -> str | None:
+    """Collapse SIRIUS's spaced adduct notation ("[M + Na]+") to the
+    unspaced form ("[M+Na]+") every downstream model's adduct lookup table
+    (e.g. ms_pred's ion2mass/ion2onehot_pos) actually uses."""
+
+    return value.replace(" ", "") if value else value
 
 
 def _summary_rows(directory: Path, pattern: str) -> list[dict]:
@@ -124,7 +132,14 @@ def run(args: argparse.Namespace) -> int:
         raise RuntimeError(f"SIRIUS exited with code {completed.returncode}.{suffix}")
     console = f"{completed.stdout}\n{completed.stderr}".casefold()
     if "login" in console and ("required" in console or "not logged" in console):
-        raise RuntimeError("SIRIUS requires an authenticated account for structure discovery.")
+        matches = [
+            line for line in f"{completed.stdout}\n{completed.stderr}".splitlines()
+            if "login" in line.casefold()
+        ]
+        raise RuntimeError(
+            "SIRIUS requires an authenticated account for structure discovery. "
+            f"Matched line(s): {matches}"
+        )
     structure_rows = _summary_rows(summaries, "structure_identifications*.tsv")
     structure_rows += _summary_rows(summaries, "structure_identifications*.csv")
     if not structure_rows:
@@ -149,11 +164,12 @@ def run(args: argparse.Namespace) -> int:
         ranks[spectrum_id] = max(ranks.get(spectrum_id, 0), rank)
         score_text = _value(source, "confidenceScore", "CSI:FingerIDScore", "score")
         score = float(score_text) if score_text else None
+        adduct = _normalize_adduct(_value(source, "adduct", "ionType"))
         normalized = {
             "schema_version": MODEL_SCHEMA_VERSION, "study_id": study_id,
             "spectrum_id": spectrum_id, "candidate_id": cid, "canonical_smiles": smiles,
             "standardized_smiles": smiles, "inchikey": inchikey, "molecular_formula": formula,
-            "adduct": _value(source, "adduct", "ionType"), "charge": None,
+            "adduct": adduct, "charge": None,
             "candidate_source": "sirius", "source_database": _value(source, "database", "links"),
             "source_rank": rank, "is_reference": False, "formula_source": "sirius",
             "adduct_source": "sirius",
@@ -164,7 +180,7 @@ def run(args: argparse.Namespace) -> int:
             "run_id": args.run_id, "checkpoint_fingerprint": None, "status": "success",
             "eligibility_reason": None, "raw_score": score, "rank": rank,
             "candidate_count": None, "rank_score": None,
-            "adduct": _value(source, "adduct", "ionType"), "collision_energy": None,
+            "adduct": adduct, "collision_energy": None,
             "collision_energy_source": None,
         }
         key = (spectrum_id, cid)

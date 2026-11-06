@@ -131,6 +131,126 @@ def test_run_analysis_model_requires_parsed_spectra_first(
         environment.run_analysis_model("flare", "ST004496", run_id="r1")
 
 
+def test_run_analysis_model_sirius_does_not_require_candidates_first(
+    config: PipelineConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = dataclasses.replace(config, sirius_home_dir=tmp_path / "sirius-home")
+    environment = DockerPipelineEnvironment(config=config)
+    (environment.study_output_dir("ST004496") / "processed" / "mzml").mkdir(parents=True)
+    spectra = environment.parsed_output_dir("ST004496", "mzml") / "spectra.parquet"
+    spectra.write_bytes(b"not-empty")
+
+    calls = _capture_run(monkeypatch)
+    environment.run_analysis_model("sirius", "ST004496", run_id="r1")
+
+    assert len(calls) == 1
+    command = calls[0]
+    assert "--candidates" not in command
+    assert "--device" not in command
+    assert "--spectra" in command and "--output-root" in command
+
+
+def test_run_analysis_model_sirius_seeds_candidates_parquet_via_root_copy(
+    config: PipelineConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The copy must happen inside a root container, not a host-side shutil
+    # copy: parse_study_payload's output is sometimes root-owned in
+    # practice, which a non-root host process cannot overwrite.
+    config = dataclasses.replace(config, sirius_home_dir=tmp_path / "sirius-home")
+    environment = DockerPipelineEnvironment(config=config)
+    (environment.study_output_dir("ST004496") / "processed" / "mzml").mkdir(parents=True)
+    spectra = environment.parsed_output_dir("ST004496", "mzml") / "spectra.parquet"
+    spectra.write_bytes(b"not-empty")
+
+    generated = environment.predictions_path("sirius", "ST004496", "r1").parent
+    generated.mkdir(parents=True)
+    (generated / "candidate_sets.parquet").write_bytes(b"sirius-candidates")
+
+    calls = _capture_run(monkeypatch)
+    environment.run_analysis_model("sirius", "ST004496", run_id="r1")
+
+    assert len(calls) == 2
+    copy_command = calls[1]
+    assert "--entrypoint" in copy_command
+    assert "sh" in copy_command
+    copy_script = copy_command[-1]
+    assert "candidate_sets.parquet" in copy_script
+    assert copy_script.strip().endswith("candidates.parquet")
+
+
+def test_run_analysis_model_sirius_raises_if_candidates_copy_fails(
+    config: PipelineConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = dataclasses.replace(config, sirius_home_dir=tmp_path / "sirius-home")
+    environment = DockerPipelineEnvironment(config=config)
+    (environment.study_output_dir("ST004496") / "processed" / "mzml").mkdir(parents=True)
+    spectra = environment.parsed_output_dir("ST004496", "mzml") / "spectra.parquet"
+    spectra.write_bytes(b"not-empty")
+
+    generated = environment.predictions_path("sirius", "ST004496", "r1").parent
+    generated.mkdir(parents=True)
+    (generated / "candidate_sets.parquet").write_bytes(b"sirius-candidates")
+
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(command)
+        completed = _FakeCompleted()
+        if len(calls) == 2:
+            completed.returncode = 1
+            completed.stderr = "cp: permission denied"
+        return completed
+
+    monkeypatch.setattr(docker_environment.subprocess, "run", fake_run)
+
+    with pytest.raises(DockerEnvironmentError, match="seeding candidates.parquet failed"):
+        environment.run_analysis_model("sirius", "ST004496", run_id="r1")
+
+
+def test_ensure_host_writable_dir_builds_mkdir_chown_command(
+    environment: DockerPipelineEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_run(monkeypatch)
+    target = tmp_path / "annotations" / "campaign_comparison"
+
+    environment.ensure_host_writable_dir(target)
+
+    assert len(calls) == 1
+    command = calls[0]
+    assert "--entrypoint" in command
+    assert "sh" in command
+    assert f"{target}:/target" in command
+    script = command[-1]
+    assert "mkdir -p /target" in script
+    assert "chown -R" in script and "/target" in script
+
+
+def test_ensure_host_writable_dir_raises_on_failure(
+    environment: DockerPipelineEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+        completed = _FakeCompleted()
+        completed.returncode = 1
+        completed.stderr = "chown: permission denied"
+        return completed
+
+    monkeypatch.setattr(docker_environment.subprocess, "run", fake_run)
+
+    with pytest.raises(DockerEnvironmentError, match="Failed to prepare writable directory"):
+        environment.ensure_host_writable_dir(tmp_path / "annotations" / "campaign_comparison")
+
+
+def test_run_analysis_model_flare_still_requires_candidates_first(
+    environment: DockerPipelineEnvironment,
+) -> None:
+    (environment.study_output_dir("ST004496") / "processed" / "mzml").mkdir(parents=True)
+    spectra = environment.parsed_output_dir("ST004496", "mzml") / "spectra.parquet"
+    spectra.write_bytes(b"not-empty")
+
+    with pytest.raises(DockerEnvironmentError, match="candidates.parquet"):
+        environment.run_analysis_model("flare", "ST004496", run_id="r1")
+
+
 def test_raw_and_processed_roots_are_distinct(
     environment: DockerPipelineEnvironment,
 ) -> None:

@@ -99,6 +99,11 @@ def run(args: argparse.Namespace) -> int:
     config = load_adduct_config(args.adduct_config)
     started = datetime.now(timezone.utc)
     temporary = Path(tempfile.mkdtemp(prefix=f".{FORMAT}-", dir=output_base.mkdir(parents=True, exist_ok=True) or output_base))
+    # mkdtemp defaults to 0700 for a private scratch dir, but this one gets
+    # published as the study's permanent output directory (see _publish
+    # below) and is read back by a host process outside this container, so
+    # the restrictive mode must not survive the rename.
+    temporary.chmod(0o755)
     counts = {"input_files": len(files), "ms2_spectra": 0, "spectra_without_precursor": 0,
               "spectra_without_collision_energy": 0, "spectra_without_adduct": 0}
     writer = None

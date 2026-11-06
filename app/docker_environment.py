@@ -25,6 +25,7 @@ payload can never also delete the processed data the analysis stage reads.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -45,6 +46,9 @@ _EMAIL_SECRET_MOUNT = "/run/secrets/mwb_email"
 #: Pinned mount point for the SIRIUS login workspace, matching the version
 #: pinned in models/README.md.
 _SIRIUS_WORKSPACE_MOUNT = "/root/.sirius-6.5"
+
+#: Models evidence (models/evidence/main.py) can merge, in its own `MODELS`.
+_EVIDENCE_SOURCE_MODELS = ("sirius", "flare", "glacier", "iceberg")
 
 
 class InvalidStudyIdError(ValueError):
@@ -147,7 +151,13 @@ class DockerPipelineEnvironment:
         freed = sum(
             entry.stat().st_size for entry in target.rglob("*") if entry.is_file()
         ) if target.exists() else 0
-        shutil.rmtree(target, ignore_errors=True)
+        # ignore_errors=True previously masked a real failure mode here: a
+        # raw payload written by an older, root-run mwextract container
+        # (before _run_mwextract started passing --user) is owned by root
+        # and this call cannot remove it, yet the caller would report
+        # "deleted": true anyway on the strength of the byte count above.
+        # A real failure must surface, not be reported as success.
+        shutil.rmtree(target)
         return freed
 
     # -- extraction -----------------------------------------------------
@@ -246,9 +256,14 @@ class DockerPipelineEnvironment:
         if candidates_sidecar is not None:
             args += ["--candidates", "/candidates-sidecar"]
             mounts.append(f"{candidates_sidecar}:/candidates-sidecar:ro")
+        # Host-owned output, same reasoning as _run_mwextract: this harness
+        # (or a campaign script like prepare_workbench_candidates.py) needs
+        # to read and, for candidates.parquet, overwrite this stage's output
+        # from the host afterward.
         return self._execute(
             image, args, mounts=mounts,
             timeout=self.config.docker_command_timeout_seconds,
+            user=f"{os.getuid()}:{os.getgid()}",
         )
 
     # -- analysis ---------------------------------------------------------
@@ -283,6 +298,14 @@ class DockerPipelineEnvironment:
         study_id = validate_study_id(study_id)
         image = self.analysis_image_tag(model_name)
         study_dir = self.study_output_dir(study_id)
+        # Deliberately root, unlike _run_mwextract/parse_study_payload: these
+        # images bake in a writable-$HOME assumption (numba's cache locator,
+        # DGL's `/.dgl`, matplotlib's `/.config`) that a host --user breaks
+        # for flare/glacier/iceberg (confirmed: PermissionError on exactly
+        # those paths). Nothing on the host ever writes into or deletes a
+        # model's output directory, so root-owned-but-world-readable
+        # predictions.parquet (the pattern every container here produces) is
+        # sufficient for aggregate/evidence to read it back.
 
         spectra_path = self._require_existing(
             self.parsed_output_dir(study_id, "mzml") / "spectra.parquet",
@@ -292,16 +315,116 @@ class DockerPipelineEnvironment:
                 "parsed spectra.parquet was found for this study."
             ),
         )
+        if model_name == "sirius":
+            # SIRIUS generates candidates rather than consuming them -- it is
+            # the only model allowed to run before candidates.parquet exists.
+            # Its own CLI (models/sirius/main.py) takes none of the
+            # --candidates/--device/--batch-size/--instrument-type flags the
+            # other models share, so it gets its own arg list rather than the
+            # generic block below.
+            if self.config.sirius_home_dir is None:
+                raise DockerEnvironmentError(
+                    "SIRIUS_HOME_DIR is not configured; run `sirius login` once "
+                    "per models/README.md and point SIRIUS_HOME_DIR at that "
+                    "workspace before requesting the sirius model."
+                )
+            args = [
+                "--spectra", f"/data/{spectra_path.relative_to(study_dir)}",
+                "--output-root", "/data", "--run-id", run_id,
+            ]
+            mounts = [
+                f"{study_dir}:/data",
+                # Read-write, deliberately: SIRIUS's refresh token rotates on
+                # every authenticated call (confirmed: even a bare `login
+                # --show`), and the rotated token must be written back here
+                # or the next call finds the one on disk already consumed
+                # and reports "not logged in" -- a `:ro` mount burns the
+                # login on its very first use, with no way to recover
+                # short of a fresh interactive `sirius login`.
+                f"{self.config.sirius_home_dir}:{_SIRIUS_WORKSPACE_MOUNT}",
+            ]
+            result = self._execute(
+                image, args, mounts=mounts,
+                timeout=self.config.docker_command_timeout_seconds,
+            )
+            if result.succeeded:
+                # Seed the canonical candidates.parquet every other model
+                # reads from, so a plain "run sirius then run <scorer>" works
+                # without the manual prepare_workbench_candidates.py step.
+                # Done as a root container `cp`, not a host-side shutil copy:
+                # parse_study_payload's output is sometimes root-owned (seen
+                # in practice despite requesting host-UID output), which a
+                # non-root host process cannot overwrite.
+                generated = (
+                    self.predictions_path("sirius", study_id, run_id).parent
+                    / "candidate_sets.parquet"
+                )
+                if generated.is_file():
+                    destination = spectra_path.parent / "candidates.parquet"
+                    copy_result = self._execute(
+                        image,
+                        [
+                            "-c",
+                            f"cp /data/{generated.relative_to(study_dir)} "
+                            f"/data/{destination.relative_to(study_dir)}",
+                        ],
+                        mounts=[f"{study_dir}:/data"],
+                        timeout=self.config.docker_command_timeout_seconds,
+                        entrypoint="sh",
+                    )
+                    if not copy_result.succeeded:
+                        raise DockerEnvironmentError(
+                            "sirius generated candidate_sets.parquet but seeding "
+                            f"candidates.parquet failed: {copy_result.stderr_tail}"
+                        )
+            return result
+
         candidates_path = self._require_existing(
             spectra_path.parent / "candidates.parquet",
             missing_hint=(
-                "No candidates.parquet next to the parsed spectra. Candidate "
-                "preparation (resolving structures/formulas via PubChem) is "
-                "not automated by this harness yet -- see "
-                "models/README.md and prepare_workbench_candidates.py, and "
-                "pass its output as parse_study_payload's candidates_sidecar."
+                "No candidates.parquet next to the parsed spectra. Run the "
+                "sirius model first to generate one -- it writes "
+                "candidate_sets.parquet and this harness copies that into "
+                "candidates.parquet automatically on success. Candidate "
+                "preparation is otherwise only wired up for ST004067/ST004496 "
+                "-- see models/README.md and prepare_workbench_candidates.py. "
+                "Note a manually prepared file must replace this exact file "
+                "directly; parse_study_payload's --candidates-sidecar is a "
+                "different, narrower schema (see "
+                "MWExtract/parsers/common/candidates.py) and cannot carry "
+                "the model-facing columns through."
             ),
         )
+
+        if model_name == "evidence":
+            # evidence does not score spectra itself -- it merges the other
+            # four models' already-published runs (models/evidence/main.py's
+            # `--model-run`, one per model, is required and repeatable), so
+            # it takes none of the --device/--batch-size/--instrument-type
+            # flags the scoring models share.
+            run_dirs = []
+            for source_model in _EVIDENCE_SOURCE_MODELS:
+                run_dir = self.predictions_path(source_model, study_id, run_id).parent
+                if (run_dir / "run_report.json").is_file():
+                    run_dirs.append(run_dir)
+            if not run_dirs:
+                raise DockerEnvironmentError(
+                    "evidence has nothing to merge: none of "
+                    f"{_EVIDENCE_SOURCE_MODELS} has a completed run under "
+                    f"run_id {run_id!r} for {study_id}. Run at least one of "
+                    "them first with this same run_id."
+                )
+            args = [
+                "--spectra", f"/data/{spectra_path.relative_to(study_dir)}",
+                "--candidates", f"/data/{candidates_path.relative_to(study_dir)}",
+                "--output-root", "/data", "--run-id", run_id,
+            ]
+            for run_dir in run_dirs:
+                args += ["--model-run", f"/data/{run_dir.relative_to(study_dir)}"]
+            return self._execute(
+                image, args, mounts=[f"{study_dir}:/data"],
+                timeout=self.config.docker_command_timeout_seconds,
+            )
 
         args = [
             "--spectra", f"/data/{spectra_path.relative_to(study_dir)}",
@@ -311,15 +434,6 @@ class DockerPipelineEnvironment:
             "--instrument-type", instrument_type,
         ]
         mounts = [f"{study_dir}:/data"]
-
-        if model_name == "sirius":
-            if self.config.sirius_home_dir is None:
-                raise DockerEnvironmentError(
-                    "SIRIUS_HOME_DIR is not configured; run `sirius login` once "
-                    "per models/README.md and point SIRIUS_HOME_DIR at that "
-                    "workspace before requesting the sirius model."
-                )
-            mounts.append(f"{self.config.sirius_home_dir}:{_SIRIUS_WORKSPACE_MOUNT}:ro")
 
         if checkpoint_bundle is not None:
             args += ["--checkpoint-bundle", "/checkpoint"]
@@ -333,13 +447,52 @@ class DockerPipelineEnvironment:
     def predictions_path(self, model_name: str, study_id: str, run_id: str) -> Path:
         """Where ``run_analysis_model`` leaves its output, per
         model_runner.py's own ``output_root/study_id/annotations/model/run_id``
-        convention applied against this harness's per-study mount."""
+        convention applied against this harness's per-study mount.
+
+        evidence (models/evidence/main.py) does not follow that convention:
+        it publishes to ``.../annotation-evidence/<run_id>/annotation_evidence.parquet``,
+        not ``.../annotations/evidence/<run_id>/predictions.parquet``. Without
+        this branch, the success check in analysis_tools.py
+        (``result.succeeded and predictions_path.is_file()``) looks in the
+        wrong place and reports a successful evidence run as failed."""
 
         study_id = validate_study_id(study_id)
+        if model_name == "evidence":
+            return (
+                self.study_output_dir(study_id) / study_id / "annotation-evidence"
+                / run_id / "annotation_evidence.parquet"
+            )
         return (
             self.study_output_dir(study_id) / study_id / "annotations"
             / model_name / run_id / "predictions.parquet"
         )
+
+    def ensure_host_writable_dir(self, path: Path) -> None:
+        """mkdir -p + chown a directory to the host UID/GID via a throwaway
+        root container.
+
+        run_analysis_model's containers are deliberately root (see its own
+        comment), so a study's ``annotations/`` tree can end up root-owned.
+        A later host-side writer (e.g. aggregate, which does its merge in
+        the host process) can't create a new subdirectory under a
+        root-owned, non-world-writable ancestor -- mkdir() itself raises
+        PermissionError. Docker auto-creates a bind-mount's host path (also
+        root-owned) if it doesn't exist yet, so mounting ``path`` and
+        chown-ing it from inside a root container fixes both cases in one
+        step.
+        """
+
+        result = self._execute(
+            self.config.mwextract_image,
+            ["-c", f"mkdir -p /target && chown -R {os.getuid()}:{os.getgid()} /target"],
+            mounts=[f"{path}:/target"],
+            timeout=30.0,
+            entrypoint="sh",
+        )
+        if not result.succeeded:
+            raise DockerEnvironmentError(
+                f"Failed to prepare writable directory {path}: {result.stderr_tail}"
+            )
 
     # -- internals ----------------------------------------------------------
 
@@ -357,7 +510,16 @@ class DockerPipelineEnvironment:
     def _run_mwextract(
         self, args: list[str], *, mounts: list[str], timeout: float,
     ) -> DockerCommandResult:
-        return self._execute(self.config.mwextract_image, args, mounts=mounts, timeout=timeout)
+        # Runs as the host UID/GID, not the image's default root, so the raw
+        # payload it writes into the host-mounted /output volume is owned by
+        # whoever runs this harness. Without this, delete_raw_study_payload
+        # below cannot actually remove it (root:root, 0755 -- the host user
+        # has no write permission on the containing directory) and the
+        # delete silently no-ops.
+        return self._execute(
+            self.config.mwextract_image, args, mounts=mounts, timeout=timeout,
+            user=f"{os.getuid()}:{os.getgid()}",
+        )
 
     def _execute(
         self,
@@ -367,8 +529,14 @@ class DockerPipelineEnvironment:
         mounts: list[str],
         timeout: float,
         gpu: bool = False,
+        user: str | None = None,
+        entrypoint: str | None = None,
     ) -> DockerCommandResult:
         command = ["docker", "run", "--rm"]
+        if user is not None:
+            command += ["--user", user]
+        if entrypoint is not None:
+            command += ["--entrypoint", entrypoint]
         if gpu:
             command.append("--gpus=all")
         for mount in mounts:

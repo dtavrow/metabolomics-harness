@@ -146,6 +146,17 @@ def cmd_aggregate(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def cmd_study_status(args: argparse.Namespace) -> dict[str, Any]:
+    from app.tools.status_tools import (
+        write_all_study_status_markdown,
+        write_study_status_markdown,
+    )
+
+    if args.study_id is None:
+        return write_all_study_status_markdown()
+    return write_study_status_markdown(args.study_id)
+
+
 def build_parser() -> argparse.ArgumentParser:
     from app.tools.analysis_tools import WORKER_SPECS
 
@@ -216,6 +227,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--models", nargs="+", required=True)
     p.add_argument("--run-id", required=True)
     p.set_defaults(handler=cmd_aggregate)
+
+    p = subparsers.add_parser(
+        "study-status",
+        help="Regenerate a study's (or every study's) markdown status from the ledger.",
+    )
+    p.add_argument("study_id", nargs="?", default=None, help="Omit to regenerate every study.")
+    p.set_defaults(handler=cmd_study_status)
 
     return parser
 

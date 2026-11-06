@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "missing=\"\"; [ -f .env ] || missing=\"$missing .env\"; [ -d .venv ] || missing=\"$missing .venv/\"; for img in mwextract:2026-09-26 mwparse-mzml:1 mwparse-mzxml:1; do docker image inspect \"$img\" >/dev/null 2>&1 || missing=\"$missing $img\"; done; if [ -n \"$missing\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Setup looks incomplete (missing:%s). Invoke the setup-harness skill before doing anything else.\"}}' \"$missing\"; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

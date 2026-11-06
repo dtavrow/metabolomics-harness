@@ -88,8 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-uncompressed-bytes", type=parse_byte_size, default=parse_byte_size("10GB"))
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--request-delay-seconds", type=float, default=0.5)
-    parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--retry-backoff-seconds", type=float, nargs="+", default=(1.0, 2.0, 4.0))
+    # Observed in practice: the Workbench FTP data connection stalls mid-transfer
+    # on multi-GB archives often enough that 3 attempts routinely exhausts
+    # before the transfer completes, even though each retry does make
+    # progress (it resumes from the partial file, see
+    # workbench_study._download_selected_archives). More attempts with a
+    # longer tail give a flaky link enough chances to actually finish.
+    parser.add_argument("--max-retries", type=int, default=8)
+    parser.add_argument(
+        "--retry-backoff-seconds", type=float, nargs="+",
+        default=(1.0, 2.0, 4.0, 8.0, 15.0, 30.0),
+    )
     parser.add_argument("--dry-run", action="store_true")
     # Archives are deleted once their members are extracted, because they are
     # always re-downloadable from the Workbench and keeping both copies more
@@ -142,6 +151,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             email=args.email,
             max_total_archive_bytes=args.max_download_bytes,
             timeout=args.timeout,
+            max_retries=args.max_retries,
+            retry_backoff_seconds=tuple(args.retry_backoff_seconds),
         )
         extracted = extract_selected_members(
             members,
