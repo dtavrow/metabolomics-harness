@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
+
+import pyarrow.parquet as pq
 
 from app.app_utils.progress_bus import get_progress_bus
 from app.disk_budget import check_disk_budget
@@ -37,6 +40,44 @@ def _extract_ms2_expected(report_text: str) -> int | None:
     if not match:
         return None
     return int(match.group(1).replace(",", ""))
+
+
+def _instrument_polarity_counts(
+    catalog_slice_path,
+    polarity: list[str] | None,
+    instrument_types: list[str] | None,
+    min_ms2_spectra: int | None,
+) -> dict[str, dict[str, int]]:
+    """Spectra-extracted counts by (instrument_type, polarity) for one
+    study's fetch, for the dashboard's heatmap.
+
+    MWExtract writes ``<STUDY_ID>.parquet`` as every file the corpus index
+    has for this study -- it is NOT narrowed to the files this particular
+    fetch actually selected (that filtered set only ever exists in a
+    temporary in-container workspace and never reaches the host; see
+    MWExtract/modelfiles/MWExtract.py's ``in_study`` vs ``kept``). Re-apply
+    the same polarity/instrument-type/min-ms2 filters this fetch call itself
+    used, so the counts match what was actually fetched whenever filters
+    were given (the common case per CLAUDE.md's workflow is no filters at
+    all, where this is exact by construction either way).
+    """
+
+    if not catalog_slice_path.is_file():
+        return {}
+    rows = pq.read_table(
+        catalog_slice_path,
+        columns=["instrument_type", "polarity", "ms2_spectrum_count"],
+    ).to_pylist()
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for row in rows:
+        if polarity and row["polarity"] not in polarity:
+            continue
+        if instrument_types and row["instrument_type"] not in instrument_types:
+            continue
+        if min_ms2_spectra and (row["ms2_spectrum_count"] or 0) < min_ms2_spectra:
+            continue
+        counts[row["instrument_type"]][row["polarity"]] += row["ms2_spectrum_count"] or 0
+    return {instrument: dict(polarities) for instrument, polarities in counts.items()}
 
 
 def list_workbench_studies(
@@ -181,10 +222,18 @@ def fetch_workbench_study(
     )
 
     ms2_expected = _extract_ms2_expected(result.stdout_tail)
+    instrument_polarity_counts = (
+        _instrument_polarity_counts(
+            _environment.raw_study_dir(study_id) / f"{study_id}.parquet",
+            polarity, instrument_types, min_ms2_spectra,
+        )
+        if status == "fetched" else {}
+    )
     append_ledger_row(
         study_id, "fetch", state=status, returncode=result.returncode,
         elapsed_seconds=result.elapsed_seconds, stdout_tail=result.stdout_tail,
         stderr_tail=result.stderr_tail, ms2_expected=ms2_expected,
+        instrument_polarity_counts=instrument_polarity_counts,
     )
     return {
         "success": status == "fetched",

@@ -17,6 +17,8 @@ no tunnel at all).
 from __future__ import annotations
 
 import asyncio
+import json
+from collections import defaultdict
 
 import pyarrow.parquet as pq
 from fastapi import APIRouter, HTTPException, Request
@@ -24,6 +26,8 @@ from fastapi.responses import StreamingResponse
 
 from app.app_utils.progress_bus import get_progress_bus, progress_log_path
 from app.docker_environment import DockerPipelineEnvironment, InvalidStudyIdError
+from app.pipeline_config import get_config
+from app.winners_db import list_winners
 
 _HEARTBEAT_SECONDS = 15
 _POLL_SECONDS = 0.5
@@ -114,5 +118,31 @@ def build_dashboard_router() -> APIRouter:
             "candidate_count": candidate_count,
             "avg_candidates_per_spectrum": avg_candidates_per_spectrum,
         }
+
+    @router.get("/dashboard/instrument-polarity-counts")
+    async def dashboard_instrument_polarity_counts() -> dict:
+        """Spectra extracted so far, cross-tabbed by instrument type and
+        polarity, for the Active tab's heatmap. Summed from every study's
+        fetch-stage ledger row (`instrument_polarity_counts`, recorded at
+        fetch time -- see app/tools/extraction_tools.py) rather than the raw
+        payload, which is routinely deleted long before a study is done."""
+
+        totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        ledger_root = get_config().agent_runs_root / "ledger"
+        for fetch_row_path in ledger_root.glob("*/fetch.json"):
+            row = json.loads(fetch_row_path.read_text(encoding="utf-8"))
+            for instrument, polarities in (row.get("instrument_polarity_counts") or {}).items():
+                for polarity, count in polarities.items():
+                    totals[instrument][polarity] += count
+
+        return {instrument: dict(polarities) for instrument, polarities in totals.items()}
+
+    @router.get("/dashboard/winners")
+    async def dashboard_winners() -> list[dict]:
+        """Spectra where 3 or more scoring models independently agree on the
+        same candidate with a normalized score (rank_score) of at least
+        0.8 -- see app/winners_db.py, populated incrementally by aggregate."""
+
+        return list_winners()
 
     return router
