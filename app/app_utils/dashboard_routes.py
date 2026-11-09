@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
+from itertools import combinations
 
+import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -136,6 +138,81 @@ def build_dashboard_router() -> APIRouter:
                     totals[instrument][polarity] += count
 
         return {instrument: dict(polarities) for instrument, polarities in totals.items()}
+
+    @router.get("/dashboard/rank-score-stats")
+    async def dashboard_rank_score_stats() -> list[dict]:
+        """Per model-pair cross-confidence, pooled across every study's
+        campaign_comparison TSV (see app/tools/aggregation_tools.py): for
+        every spectrum, each model names its own rank-1 ("favorite")
+        candidate. For a pair of models (A, B) this asks -- when A is
+        confident in its favorite, how confident is B in that same
+        candidate, and vice versa? avg_rank_score is the mean of those
+        cross-lookups; disparity_mad is their mean absolute deviation from
+        that mean.
+
+        This is deliberately NOT an average of the rank_score column itself:
+        rank_score is 1 - (rank-1)/(candidate_count-1), so within any one
+        spectrum the candidates already span the full 0..1 range by
+        construction, which forces a plain average toward ~0.5 regardless of
+        model quality -- true for the whole table, for one model's rows, or
+        even for the candidates two models happen to share (all five models
+        score the same sirius-generated candidate pool, so "shared" is
+        nearly everything). Cross-looking up specifically each other's
+        favorite is what breaks that symmetry. Genuine agreement on a single
+        best candidate is the selective, harder-to-reach case, so this
+        skewing toward lower scores is expected, not a bug."""
+
+        # key -> model -> candidate_id ranked #1 by that model
+        top_pick: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
+        # key -> model -> candidate_id -> rank_score
+        scores: dict[tuple[str, str], dict[str, dict[str, float]]] = defaultdict(
+            lambda: defaultdict(dict),
+        )
+
+        comparison_root = get_config().agent_runs_root / "processed"
+        for tsv_path in comparison_root.glob("*/*/annotations/campaign_comparison/*.tsv"):
+            table = pacsv.read_csv(
+                tsv_path, parse_options=pacsv.ParseOptions(delimiter="\t"),
+            )
+            columns = table.select(
+                ["study_id", "spectrum_id", "candidate_id", "model_name", "status", "rank", "rank_score"],
+            ).to_pydict()
+            for study_id, spectrum_id, candidate_id, model_name, status, rank, rank_score in zip(
+                columns["study_id"], columns["spectrum_id"], columns["candidate_id"],
+                columns["model_name"], columns["status"], columns["rank"], columns["rank_score"],
+                strict=True,
+            ):
+                if status != "success" or rank_score is None:
+                    continue
+                key = (study_id, spectrum_id)
+                scores[key][model_name][candidate_id] = rank_score
+                if rank == 1:
+                    top_pick[key][model_name] = candidate_id
+
+        pair_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+        for key, picks in top_pick.items():
+            for model_a, model_b in combinations(sorted(picks), 2):
+                candidate_a, candidate_b = picks[model_a], picks[model_b]
+                cross_a_on_b = scores[key][model_a].get(candidate_b)
+                cross_b_on_a = scores[key][model_b].get(candidate_a)
+                if cross_a_on_b is not None:
+                    pair_values[(model_a, model_b)].append(cross_a_on_b)
+                if cross_b_on_a is not None:
+                    pair_values[(model_a, model_b)].append(cross_b_on_a)
+
+        results = []
+        for pair, values in sorted(pair_values.items()):
+            mean = sum(values) / len(values)
+            mad = sum(abs(value - mean) for value in values) / len(values)
+            results.append({
+                "model_a": pair[0],
+                "model_b": pair[1],
+                "pair_label": f"{pair[0]} x {pair[1]}",
+                "avg_rank_score": mean,
+                "disparity_mad": mad,
+                "n": len(values),
+            })
+        return results
 
     @router.get("/dashboard/winners")
     async def dashboard_winners() -> list[dict]:
