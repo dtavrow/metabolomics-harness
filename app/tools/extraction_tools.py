@@ -70,6 +70,11 @@ def _instrument_polarity_counts(
     ).to_pylist()
     counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for row in rows:
+        # A null instrument_type/polarity means the source metadata didn't
+        # record one -- skip rather than emit a None dict key, which would
+        # later crash json.dump(..., sort_keys=True) comparing None to str.
+        if row["instrument_type"] is None or row["polarity"] is None:
+            continue
         if polarity and row["polarity"] not in polarity:
             continue
         if instrument_types and row["instrument_type"] not in instrument_types:
