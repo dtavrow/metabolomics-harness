@@ -163,8 +163,3 @@ uv run python -m app.cli aggregate ST004496 --models iceberg --run-id <run-id>
 Each subcommand prints one JSON object to stdout; run
 `uv run python -m app.cli --help` for the full list.
 
-
-
-```bash
-uv run uvicorn app.dashboard_app:app --host 0.0.0.0 --port 8000
-```
