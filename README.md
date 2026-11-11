@@ -163,11 +163,7 @@ uv run python -m app.cli aggregate ST004496 --models iceberg --run-id <run-id>
 Each subcommand prints one JSON object to stdout; run
 `uv run python -m app.cli --help` for the full list.
 
-## Optional: live progress dashboard
 
-`app/dashboard_app.py` is a small, separate FastAPI server that tails the
-same progress log the CLI writes and serves it as Server-Sent Events --
-entirely optional, for a standalone frontend to show a run live.
 
 ```bash
 uv run uvicorn app.dashboard_app:app --host 0.0.0.0 --port 8000
