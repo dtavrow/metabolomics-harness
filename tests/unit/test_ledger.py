@@ -20,6 +20,7 @@ def _isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         analysis_max_concurrency=2,
         disk_budget_bytes=None,
         disk_reserve_bytes=0,
+        study_footprint_budget_bytes=None,
         docker_command_timeout_seconds=60.0,
         mwextract_image="x",
         mwparse_mzml_image="x",

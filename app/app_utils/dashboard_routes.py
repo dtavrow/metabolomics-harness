@@ -214,6 +214,57 @@ def build_dashboard_router() -> APIRouter:
             })
         return results
 
+    @router.get("/dashboard/candidate-agreement-histogram")
+    async def dashboard_candidate_agreement_histogram() -> dict:
+        """Selection-by-selection model agreement, pooled across every
+        study's campaign_comparison TSV: for each spectrum scored by 2+
+        models, each model names its own rank-1 ("favorite") candidate (same
+        top_pick idea as rank-score-stats above). This buckets the largest
+        same-candidate cluster among those picks, divided by how many models
+        scored that spectrum, into a fixed-width [0, 1] histogram -- 0 means
+        every model picked a different candidate, 1 means they all picked
+        the same one. Unlike rank-score-stats's cross-confidence (a
+        confidence-weighted average over model pairs), this is a literal
+        count of agreement, one data point per spectrum, so it reads
+        directly as "how often do the models converge on one structure vs.
+        scatter across several."""
+
+        bin_count = 20
+        edges = [i / bin_count for i in range(bin_count + 1)]
+        counts = [0] * bin_count
+
+        # key -> model -> candidate_id ranked #1 by that model
+        top_pick: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
+
+        comparison_root = get_config().agent_runs_root / "processed"
+        for tsv_path in comparison_root.glob("*/*/annotations/campaign_comparison/*.tsv"):
+            table = pacsv.read_csv(
+                tsv_path, parse_options=pacsv.ParseOptions(delimiter="\t"),
+            )
+            columns = table.select(
+                ["study_id", "spectrum_id", "candidate_id", "model_name", "status", "rank"],
+            ).to_pydict()
+            for study_id, spectrum_id, candidate_id, model_name, status, rank in zip(
+                columns["study_id"], columns["spectrum_id"], columns["candidate_id"],
+                columns["model_name"], columns["status"], columns["rank"],
+                strict=True,
+            ):
+                if status != "success" or rank != 1:
+                    continue
+                top_pick[(study_id, spectrum_id)][model_name] = candidate_id
+
+        for picks in top_pick.values():
+            if len(picks) < 2:
+                continue
+            tally: dict[str, int] = defaultdict(int)
+            for candidate_id in picks.values():
+                tally[candidate_id] += 1
+            agreement_fraction = max(tally.values()) / len(picks)
+            bucket = min(int(agreement_fraction * bin_count), bin_count - 1)
+            counts[bucket] += 1
+
+        return {"bin_edges": edges, "counts": counts, "n": sum(counts)}
+
     @router.get("/dashboard/winners")
     async def dashboard_winners() -> list[dict]:
         """Spectra where 3 or more scoring models independently agree on the

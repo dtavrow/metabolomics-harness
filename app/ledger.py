@@ -64,3 +64,44 @@ def read_ledger_row(study_id: str, stage: str) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def oversized_studies_path() -> Path:
+    config = get_config()
+    return config.agent_runs_root / "oversized_studies.json"
+
+
+def record_oversized_study(
+    study_id: str, stage: str, reason: str, total_bytes: float, budget_bytes: float,
+) -> Path:
+    """Record a study that exceeds the per-study disk budget, both in the
+    per-study ledger (so ``study-status`` shows it) and in one flat,
+    deduplicated list (so "which studies are we skipping and why" doesn't
+    require scanning every study's ledger).
+
+    Callers should treat a study with an entry here as a permanent skip, not
+    a transient refusal to retry later -- unlike the global raw-budget
+    refusal, this condition cannot be resolved by other studies freeing
+    space.
+    """
+
+    append_ledger_row(
+        study_id, stage, state="oversized", reason=reason,
+        total_bytes=total_bytes, budget_bytes=budget_bytes,
+    )
+
+    path = oversized_studies_path()
+    existing: list[dict[str, Any]] = []
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    existing = [row for row in existing if row.get("study_id") != study_id]
+    existing.append({
+        "study_id": study_id,
+        "stage": stage,
+        "reason": reason,
+        "total_bytes": total_bytes,
+        "budget_bytes": budget_bytes,
+        "recorded_utc": utc_now(),
+    })
+    write_json_atomic({"oversized_studies": existing}, path)
+    return path

@@ -129,6 +129,8 @@ def cmd_run_model(args: argparse.Namespace) -> dict[str, Any]:
         args.model_name, args.study_id, args.run_id,
         device=args.device, batch_size=args.batch_size,
         instrument_type=args.instrument_type,
+        candidate_timeout_seconds=args.candidate_timeout_seconds,
+        num_cpu_workers=args.num_cpu_workers,
     )
 
 
@@ -214,8 +216,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("study_id")
     p.add_argument("run_id")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument(
+        "--batch-size", type=int, default=None,
+        help=(
+            "Omit to use the model-dependent default (8 for glacier/iceberg "
+            "-- their GNN batches are much heavier per item than flare/"
+            "jestr's, which default to 32). Lower this first if a GPU run "
+            "OOMs."
+        ),
+    )
     p.add_argument("--instrument-type", default="Orbitrap")
+    p.add_argument(
+        "--candidate-timeout-seconds", type=float, default=None,
+        help=(
+            "sirius only. Per-spectrum wall-clock budget for candidate "
+            "generation; spectra that blow it are skipped and counted "
+            "instead of holding up the whole study. Omit to disable."
+        ),
+    )
+    p.add_argument(
+        "--num-cpu-workers", type=int, default=None,
+        help=(
+            "glacier/iceberg only. Parallelizes their upstream ms-pred "
+            "fragment-enumeration preprocessing (serial by default) across "
+            "this many CPU workers. Only raise this when the host has spare "
+            "CPU headroom. Omit to leave the upstream serial default."
+        ),
+    )
     p.set_defaults(handler=cmd_run_model)
 
     p = subparsers.add_parser("generate-run-id", help="Generate a run id to share across one study's model calls.")

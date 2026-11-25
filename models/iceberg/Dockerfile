@@ -42,9 +42,11 @@ COPY models/common/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 # requirements.txt pins pyarrow==26.0.0, which requires numpy>=2 -- conflicts
 # with the numpy<2 patch_mspred_cu118.py applies for dgl/torch-2.2.1
-# compatibility. Re-pin to a numpy-1.x-era pyarrow for the cu118 build only.
+# compatibility. 17.0.0 is the floor that still supports numpy<2 (18+ require
+# numpy>=2) and also ray.data's own floor (it needs pyarrow>=17), so it's the
+# one version satisfying both constraints at once.
 RUN if [ "${MSPRED_EXTRA}" = "cu118" ]; then \
-      uv pip install --python /opt/ms-pred/.venv/bin/python "numpy<2" "pyarrow==14.0.2"; \
+      uv pip install --python /opt/ms-pred/.venv/bin/python "numpy<2" "pyarrow==17.0.0"; \
     fi
 COPY models/common/ /app/
 COPY models/iceberg/main.py /app/main.py

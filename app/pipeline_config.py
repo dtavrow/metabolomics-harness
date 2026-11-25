@@ -69,6 +69,7 @@ class PipelineConfig:
     analysis_max_concurrency: int
     disk_budget_bytes: float | None
     disk_reserve_bytes: float
+    study_footprint_budget_bytes: float | None
     docker_command_timeout_seconds: float
     mwextract_image: str
     mwparse_mzml_image: str
@@ -88,10 +89,17 @@ class PipelineConfig:
                 os.environ.get("ANALYSIS_MAX_CONCURRENCY", "2")
             ),
             disk_budget_bytes=_optional_byte_size(
-                os.environ.get("DISK_BUDGET_BYTES", "100GB")
+                os.environ.get("DISK_BUDGET_BYTES", "200GB")
             ),
             disk_reserve_bytes=parse_byte_size(
                 os.environ.get("DISK_RESERVE_BYTES", "50GB")
+            ),
+            # Per-study ceiling on raw + processed combined -- distinct from
+            # disk_budget_bytes above, which is the *global* raw-only budget.
+            # A study already at or over this is recorded as oversized and
+            # skipped rather than retried (see app/disk_budget.py).
+            study_footprint_budget_bytes=_optional_byte_size(
+                os.environ.get("STUDY_DISK_BUDGET_BYTES", "200GB")
             ),
             docker_command_timeout_seconds=float(
                 os.environ.get("DOCKER_COMMAND_TIMEOUT_SECONDS", str(4 * 3600))

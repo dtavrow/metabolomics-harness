@@ -294,8 +294,15 @@ class DockerPipelineEnvironment:
         batch_size: int = 32,
         instrument_type: str = "Orbitrap",
         checkpoint_bundle: Path | None = None,
+        candidate_timeout_seconds: float | None = None,
+        num_cpu_workers: int | None = None,
     ) -> DockerCommandResult:
         study_id = validate_study_id(study_id)
+        if num_cpu_workers is not None and model_name not in ("glacier", "iceberg"):
+            raise DockerEnvironmentError(
+                "--num-cpu-workers only applies to glacier/iceberg's ms-pred "
+                f"preprocessing step, not {model_name!r}."
+            )
         image = self.analysis_image_tag(model_name)
         study_dir = self.study_output_dir(study_id)
         # Deliberately root, unlike _run_mwextract/parse_study_payload: these
@@ -332,6 +339,8 @@ class DockerPipelineEnvironment:
                 "--spectra", f"/data/{spectra_path.relative_to(study_dir)}",
                 "--output-root", "/data", "--run-id", run_id,
             ]
+            if candidate_timeout_seconds is not None:
+                args += ["--candidate-timeout-seconds", str(candidate_timeout_seconds)]
             mounts = [
                 f"{study_dir}:/data",
                 # Read-write, deliberately: SIRIUS's refresh token rotates on
@@ -439,8 +448,12 @@ class DockerPipelineEnvironment:
             args += ["--checkpoint-bundle", "/checkpoint"]
             mounts.append(f"{checkpoint_bundle}:/checkpoint:ro")
 
+        env = None
+        if num_cpu_workers is not None:
+            env = {"MSPRED_NUM_CPU_WORKERS": str(num_cpu_workers)}
+
         return self._execute(
-            image, args, mounts=mounts, gpu=(device == "cuda"),
+            image, args, mounts=mounts, gpu=(device == "cuda"), env=env,
             timeout=self.config.docker_command_timeout_seconds,
         )
 
@@ -531,14 +544,25 @@ class DockerPipelineEnvironment:
         gpu: bool = False,
         user: str | None = None,
         entrypoint: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> DockerCommandResult:
         command = ["docker", "run", "--rm"]
+        # Docker's 64MB default /dev/shm is too small for a PyTorch
+        # DataLoader with multiple workers -- confirmed on ST005017/glacier,
+        # which ran for ~4h45m (98% done, 101,837/104,224 items) before every
+        # worker died at once with "Unexpected bus error ... insufficient
+        # shared memory (shm)". /dev/shm is tmpfs, so this only costs host
+        # RAM for what's actually used, not a pre-allocation -- safe to set
+        # generously for every container, not just the GPU model ones.
+        command += ["--shm-size", "4g"]
         if user is not None:
             command += ["--user", user]
         if entrypoint is not None:
             command += ["--entrypoint", entrypoint]
         if gpu:
             command.append("--gpus=all")
+        for key, value in (env or {}).items():
+            command += ["-e", f"{key}={value}"]
         for mount in mounts:
             command += ["-v", mount]
         command.append(image)

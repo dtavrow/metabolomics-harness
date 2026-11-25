@@ -9,13 +9,23 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 from candidates import read_candidates
 from checkpoints import load_checkpoint_bundle
 from contracts import (
-    CE_SEARCH_SCHEMA, ELIGIBILITY_SCHEMA, MODEL_SCHEMA_VERSION, PREDICTION_SCHEMA,
+    CE_SEARCH_SCHEMA,
+    ELIGIBILITY_SCHEMA,
+    MODEL_SCHEMA_VERSION,
+    PREDICTION_SCHEMA,
 )
-from runtime import atomic_directory, expand_command, run_command, utc_now, write_json, write_rows
+from rdkit import Chem, RDLogger
+from runtime import (
+    atomic_directory,
+    expand_command,
+    run_command,
+    utc_now,
+    write_json,
+    write_rows,
+)
 from spectra import collision_energies, read_spectra
 
 BACKEND_INPUT_SCHEMA = pa.schema([
@@ -35,6 +45,8 @@ BACKEND_INPUT_SCHEMA = pa.schema([
 ])
 
 BACKEND_REQUIRED = {"spectrum_id", "candidate_id", "collision_energy", "raw_score"}
+
+RDLogger.DisableLog("rdApp.*")
 
 
 def parser(model: str) -> argparse.ArgumentParser:
@@ -70,14 +82,20 @@ def _reason(model: str, spectrum: dict, candidate: dict, adduct: str | None) -> 
         return "missing_candidate_smiles"
     if "." in candidate["canonical_smiles"]:
         return "multi_component_candidate"
+    if Chem.MolFromSmiles(candidate["canonical_smiles"]) is None:
+        return "invalid_smiles"
     if not adduct:
         return "missing_adduct"
     if model == "flare" and not candidate.get("molecular_formula"):
         return "missing_molecular_formula"
     if model == "jestr":
+        # No strict= here: this module is shared verbatim into jestr's
+        # Python 3.9 container (models/jestr/Dockerfile.cpu), and zip's
+        # strict= kwarg is 3.10+. mz_array/intensity_array always come from
+        # the same peak list, so length mismatch isn't a real case to guard.
         usable = [
-            float(intensity) for mz, intensity in zip(
-                spectrum.get("mz_array") or [], spectrum.get("intensity_array") or []
+            float(intensity) for mz, intensity in zip(  # noqa: B905
+                spectrum.get("mz_array") or [], spectrum.get("intensity_array") or [],
             ) if float(mz) <= 1000 and float(intensity) > 0
         ]
         if not usable:

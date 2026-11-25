@@ -16,13 +16,14 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from app.app_utils.progress_bus import get_progress_bus
-from app.disk_budget import check_disk_budget
+from app.disk_budget import check_disk_budget, check_study_footprint
 from app.docker_environment import (
     DockerEnvironmentError,
     DockerPipelineEnvironment,
     InvalidStudyIdError,
 )
-from app.ledger import append_ledger_row
+from app.ledger import append_ledger_row, record_oversized_study
+from app.pipeline_config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +184,42 @@ def fetch_workbench_study(
             as the amount checked against the disk budget before fetching.
     """
 
-    budget_status = check_disk_budget(required_bytes=max_uncompressed_bytes or 0.0)
+    footprint_status = check_study_footprint(
+        study_id,
+        _environment.raw_study_dir(study_id),
+        _environment.study_output_dir(study_id),
+    )
+    if footprint_status.oversized:
+        record_oversized_study(
+            study_id, "fetch", footprint_status.reason,
+            footprint_status.total_bytes, footprint_status.budget_bytes,
+        )
+        return {
+            "success": False, "status": "oversized_skip",
+            "reason": footprint_status.reason,
+        }
+
+    # Always cap a single fetch at the per-study footprint budget, even if
+    # the caller didn't pass its own ceiling -- a study whose own payload
+    # alone can never fit should be skipped and recorded, not downloaded
+    # and then discovered to be oversized afterward.
+    config = get_config()
+    effective_uncompressed_cap = (
+        max_uncompressed_bytes
+        if max_uncompressed_bytes is not None
+        else config.study_footprint_budget_bytes
+    )
+
+    budget_status = check_disk_budget(required_bytes=effective_uncompressed_cap or 0.0)
+    if budget_status.oversized:
+        record_oversized_study(
+            study_id, "fetch", budget_status.reason,
+            effective_uncompressed_cap, budget_status.budget_bytes,
+        )
+        return {
+            "success": False, "status": "oversized_skip",
+            "reason": budget_status.reason,
+        }
     if budget_status.refused:
         append_ledger_row(
             study_id, "fetch", state="refused", reason=budget_status.reason,
@@ -205,7 +241,7 @@ def fetch_workbench_study(
             acquisition_types=acquisition_types,
             min_ms2_spectra=min_ms2_spectra,
             max_download_bytes=max_download_bytes,
-            max_uncompressed_bytes=max_uncompressed_bytes,
+            max_uncompressed_bytes=effective_uncompressed_cap,
         )
     except (InvalidStudyIdError, DockerEnvironmentError) as error:
         logger.info("Extraction of study %s done: error", study_id)

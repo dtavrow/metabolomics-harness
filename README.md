@@ -54,6 +54,13 @@ step, not to improvise shell commands.
 - **Guardrails before destructive actions.** A disk-budget check runs
   before every fetch; a 4-point safety check runs before every raw-payload
   delete; a cross-process lock caps concurrent model containers.
+- **Guardrails on SIRIUS's own output.** `run-model sirius` filters out
+  any candidate whose SMILES RDKit can't parse (SIRIUS/CSI:FingerID
+  occasionally reports a chemically invalid structure from its PubChem
+  lookup) and caps every spectrum to its top `--top-k` candidates (default
+  50) even when several molecular-formula hypotheses collectively produce
+  more -- both self-correcting, surfaced in `run-model`'s stdout and
+  `run_report.json`'s `counts`, never a reason to retry.
 - **Deterministic, versioned reproducibility.** Run ids are derived from
   the pipeline's own version (`st005046-1-0-0`, not a random timestamp),
   so results aggregate by model version rather than by invocation.

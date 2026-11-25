@@ -32,6 +32,7 @@ def config(tmp_path: Path) -> PipelineConfig:
         analysis_max_concurrency=2,
         disk_budget_bytes=100_000_000_000,
         disk_reserve_bytes=50_000_000_000,
+        study_footprint_budget_bytes=200_000_000_000,
         docker_command_timeout_seconds=60.0,
         mwextract_image="mwextract:test",
         mwparse_mzml_image="mwparse-mzml:test",
@@ -56,7 +57,7 @@ class _FakeCompleted:
 def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     calls: list[list[str]] = []
 
-    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(command, **kwargs):
         calls.append(command)
         return _FakeCompleted()
 
@@ -105,6 +106,21 @@ def test_list_studies_builds_expected_flags(
     assert "--min-ms2-spectra" in command and "10" in command
 
 
+def test_every_docker_run_raises_shm_size_past_default(
+    environment: DockerPipelineEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A PyTorch DataLoader with multiple workers can exceed docker's 64MB
+    # default /dev/shm and crash with a bus error (seen on ST005017/glacier,
+    # ~4h45m into a run) -- every container this harness launches should get
+    # a larger shm, not just the GPU model ones, since it's tmpfs and costs
+    # nothing unused.
+    calls = _capture_run(monkeypatch)
+    environment.list_workbench_studies(polarity=["negative"])
+    command = calls[0]
+    assert "--shm-size" in command
+    assert command[command.index("--shm-size") + 1] == "4g"
+
+
 def test_run_analysis_model_rejects_unknown_model(
     environment: DockerPipelineEnvironment,
 ) -> None:
@@ -127,7 +143,7 @@ def test_run_analysis_model_requires_sirius_home_dir(
 def test_run_analysis_model_requires_parsed_spectra_first(
     environment: DockerPipelineEnvironment,
 ) -> None:
-    with pytest.raises(DockerEnvironmentError, match="spectra.parquet"):
+    with pytest.raises(DockerEnvironmentError, match=r"spectra\.parquet"):
         environment.run_analysis_model("flare", "ST004496", run_id="r1")
 
 
@@ -193,7 +209,7 @@ def test_run_analysis_model_sirius_raises_if_candidates_copy_fails(
 
     calls: list[list[str]] = []
 
-    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(command, **kwargs):
         calls.append(command)
         completed = _FakeCompleted()
         if len(calls) == 2:
@@ -203,7 +219,7 @@ def test_run_analysis_model_sirius_raises_if_candidates_copy_fails(
 
     monkeypatch.setattr(docker_environment.subprocess, "run", fake_run)
 
-    with pytest.raises(DockerEnvironmentError, match="seeding candidates.parquet failed"):
+    with pytest.raises(DockerEnvironmentError, match=r"seeding candidates\.parquet failed"):
         environment.run_analysis_model("sirius", "ST004496", run_id="r1")
 
 
@@ -228,7 +244,7 @@ def test_ensure_host_writable_dir_builds_mkdir_chown_command(
 def test_ensure_host_writable_dir_raises_on_failure(
     environment: DockerPipelineEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(command, **kwargs):
         completed = _FakeCompleted()
         completed.returncode = 1
         completed.stderr = "chown: permission denied"
@@ -247,7 +263,7 @@ def test_run_analysis_model_flare_still_requires_candidates_first(
     spectra = environment.parsed_output_dir("ST004496", "mzml") / "spectra.parquet"
     spectra.write_bytes(b"not-empty")
 
-    with pytest.raises(DockerEnvironmentError, match="candidates.parquet"):
+    with pytest.raises(DockerEnvironmentError, match=r"candidates\.parquet"):
         environment.run_analysis_model("flare", "ST004496", run_id="r1")
 
 
@@ -261,7 +277,7 @@ def test_raw_and_processed_roots_are_distinct(
 def test_timeout_is_reported_without_raising(
     environment: DockerPipelineEnvironment, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(command, **kwargs):
         raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout", 0))
 
     monkeypatch.setattr(docker_environment.subprocess, "run", fake_run)

@@ -13,12 +13,13 @@ from typing import Any
 
 from app.app_utils.progress_bus import get_progress_bus
 from app.concurrency import analysis_slot
+from app.disk_budget import check_study_footprint
 from app.docker_environment import (
     DockerEnvironmentError,
     DockerPipelineEnvironment,
     InvalidStudyIdError,
 )
-from app.ledger import append_ledger_row
+from app.ledger import append_ledger_row, record_oversized_study
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +77,10 @@ def run_analysis_model(
     study_id: str,
     run_id: str,
     device: str = "cpu",
-    batch_size: int = 32,
+    batch_size: int | None = None,
     instrument_type: str = "Orbitrap",
+    candidate_timeout_seconds: float | None = None,
+    num_cpu_workers: int | None = None,
 ) -> dict[str, Any]:
     """Run one scoring model against one study's parsed spectra/candidates.
 
@@ -87,9 +90,20 @@ def run_analysis_model(
         run_id: A label for this run, used in the output path; reuse it
             across models in the same campaign so results are comparable.
         device: "cpu" or "cuda".
-        batch_size: Backend inference batch size.
+        batch_size: Backend inference batch size. None (default) resolves to
+            8 for glacier/iceberg (heavier GNN batches, more prone to GPU
+            OOM) or 32 for flare/jestr.
         instrument_type: Recorded in the run report; defaults to Orbitrap,
             matching the MassSpecGym checkpoint inputs.
+        candidate_timeout_seconds: sirius only. Per-spectrum wall-clock
+            budget for candidate generation; spectra that blow it are
+            skipped (and counted/reported in run_report.json) instead of
+            holding up the whole study. None (default) disables this.
+        num_cpu_workers: glacier/iceberg only. Parallelizes their upstream
+            ms-pred fragment-enumeration preprocessing (serial by default)
+            across this many CPU workers. Raise only when the host has spare
+            CPU headroom -- it competes with whatever else is running
+            concurrently. None (default) leaves the upstream serial default.
     """
 
     if model_name not in WORKER_SPECS:
@@ -97,6 +111,31 @@ def run_analysis_model(
             f"Unknown analysis model {model_name!r}; expected one of "
             f"{sorted(WORKER_SPECS)}."
         )
+
+    if batch_size is None:
+        batch_size = 8 if model_name in ("glacier", "iceberg") else 32
+
+    footprint_status = check_study_footprint(
+        study_id,
+        _environment.raw_study_dir(study_id),
+        _environment.study_output_dir(study_id),
+    )
+    if footprint_status.oversized:
+        record_oversized_study(
+            study_id, f"analysis_{model_name}", footprint_status.reason,
+            footprint_status.total_bytes, footprint_status.budget_bytes,
+        )
+        logger.info(
+            "Evaluation of study %s on %s done: oversized, skipped", study_id, model_name,
+        )
+        get_progress_bus().publish(
+            stage="scoring", key=f"{study_id}:{model_name}", status="oversized_skip",
+            detail=footprint_status.reason,
+        )
+        return {
+            "success": False, "status": "oversized_skip",
+            "error": footprint_status.reason,
+        }
 
     readiness = check_model_ready(model_name)
     if not readiness["ready"]:
@@ -114,11 +153,13 @@ def run_analysis_model(
         stage="scoring", key=f"{study_id}:{model_name}", status="running",
         detail="starting...",
     )
-    with analysis_slot():
+    with analysis_slot(model_name):
         try:
             result = _environment.run_analysis_model(
                 model_name, study_id, run_id=run_id, device=device,
                 batch_size=batch_size, instrument_type=instrument_type,
+                candidate_timeout_seconds=candidate_timeout_seconds,
+                num_cpu_workers=num_cpu_workers,
             )
         except (InvalidStudyIdError, DockerEnvironmentError) as error:
             logger.info("Evaluation of study %s on %s done: error", study_id, model_name)

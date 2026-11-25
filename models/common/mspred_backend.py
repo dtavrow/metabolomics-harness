@@ -25,9 +25,13 @@ def _parser(model: str) -> argparse.ArgumentParser:
 
 
 def _command(model: str, args: argparse.Namespace, labels: Path, work: Path) -> list[str]:
+    # Serial (0) unless MSPRED_NUM_CPU_WORKERS is set on the container -- the
+    # host passes this via `docker run -e`, not a baked-in flag, since it's a
+    # host-capacity decision made per run, not a property of the checkpoint.
+    num_cpu_workers = os.environ.get("MSPRED_NUM_CPU_WORKERS", "0")
     common = [
         "--sparse-out", "--sparse-k", "100", "--batch-size", str(args.batch_size),
-        "--num-cpu-workers", "0", "--dataset-labels", str(labels),
+        "--num-cpu-workers", num_cpu_workers, "--dataset-labels", str(labels),
         "--save-dir", str(work), "--out-name", "predictions.hdf5",
     ]
     if args.device == "cuda":

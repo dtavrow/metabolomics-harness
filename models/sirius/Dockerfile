@@ -23,6 +23,13 @@ ENV CONDA_PREFIX=/opt/conda
 ENV PATH="/opt/sirius/bin:${PATH}"
 COPY models/common/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+# For the candidate-validity check in main.py (RDKit can't parse/sanitize a
+# SMILES => the structure SIRIUS reported is chemically invalid, not just
+# an eligibility gap downstream models would otherwise have to discover
+# independently). Plain pip install here, deliberately not conda -- this
+# image already resolved its Python toolchain via conda earlier and this is
+# the one extra package needed on top of it.
+RUN pip install --no-cache-dir rdkit
 COPY models/common/ /app/
 COPY models/sirius/main.py /app/main.py
 COPY models/sirius/preprocess.py /app/preprocess.py
